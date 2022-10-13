@@ -195,8 +195,11 @@ func (o AdapterServerOptions) RunCustomMetricsAdapterServer(stopCh <-chan struct
 
 		collectorFactory.RegisterExternalCollector([]string{collector.PrometheusMetricType, collector.PrometheusMetricNameLegacy}, promPlugin)
 
+		// TODO: o.SkipperExternalMetrics
+		const o_SkipperExternalMetrics = true
+
 		// skipper collector can only be enabled if prometheus is.
-		if o.SkipperIngressMetrics || o.SkipperRouteGroupMetrics {
+		if o.SkipperIngressMetrics || o.SkipperRouteGroupMetrics || o_SkipperExternalMetrics {
 			skipperPlugin, err := collector.NewSkipperCollectorPlugin(client, rgClient, promPlugin, o.SkipperBackendWeightAnnotation)
 			if err != nil {
 				return fmt.Errorf("failed to initialize skipper collector plugin: %v", err)
@@ -214,6 +217,10 @@ func (o AdapterServerOptions) RunCustomMetricsAdapterServer(stopCh <-chan struct
 				if err != nil {
 					return fmt.Errorf("failed to register skipper RouteGroup collector plugin: %v", err)
 				}
+			}
+
+			if o_SkipperExternalMetrics {
+				collectorFactory.RegisterExternalCollector([]string{collector.SkipperMetricType}, skipperPlugin)
 			}
 		}
 	}

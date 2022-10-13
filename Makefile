@@ -8,6 +8,7 @@ SOURCES       = $(shell find . -name '*.go')
 DOCKERFILE    ?= Dockerfile
 GOPKGS        = $(shell go list ./...)
 BUILD_FLAGS   ?= -v
+TEST_FLAGS    ?= -v -coverprofile=profile.cov
 OPENAPI       ?= pkg/api/generated/openapi/zz_generated.openapi.go
 LDFLAGS       ?= -X main.version=$(VERSION) -w -s
 CRD_SOURCES    = $(shell find pkg/apis/zalando.org -name '*.go')
@@ -23,7 +24,7 @@ clean:
 	rm -rf $(OPENAPI)
 
 test: $(GENERATED)
-	go test -v -coverprofile=profile.cov $(GOPKGS)
+	go test $(TEST_FLAGS) $(GOPKGS)
 
 check: $(GENERATED)
 	go mod download

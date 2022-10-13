@@ -16,10 +16,10 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/metrics/pkg/apis/custom_metrics"
 )
 
 const (
+	SkipperMetricType         = "skipper"
 	rpsQuery                  = `scalar(sum(rate(skipper_serve_host_duration_seconds_count{host=~"%s"}[1m])) * %.4f)`
 	rpsMetricName             = "requests-per-second"
 	rpsMetricBackendSeparator = ","
@@ -50,6 +50,23 @@ func NewSkipperCollectorPlugin(client kubernetes.Interface, rgClient rginterface
 
 // NewCollector initializes a new skipper collector from the specified HPA.
 func (c *SkipperCollectorPlugin) NewCollector(hpa *autoscalingv2.HorizontalPodAutoscaler, config *MetricConfig, interval time.Duration) (Collector, error) {
+	if config.Type == autoscalingv2.ExternalMetricSourceType {
+		if config.Metric.Selector == nil {
+			return nil, fmt.Errorf("selector is not specified")
+		}
+		metricName, ok := config.Metric.Selector.MatchLabels["metric"]
+		if !ok {
+			return nil, fmt.Errorf("metric name is not specified")
+		}
+		if metricName != rpsMetricName {
+			return nil, fmt.Errorf("metric %s is not supported", metricName)
+		}
+		if _, ok := config.Metric.Selector.MatchLabels["host"]; !ok {
+			return nil, fmt.Errorf("host is not specified")
+		}
+		return NewSkipperCollector(nil, nil, c.plugin, hpa, config, interval, nil, "")
+	}
+
 	if strings.HasPrefix(config.Metric.Name, rpsMetricName) {
 		backend, ok := config.Config["backend"]
 		if !ok {
@@ -72,8 +89,6 @@ func (c *SkipperCollectorPlugin) NewCollector(hpa *autoscalingv2.HorizontalPodAu
 type SkipperCollector struct {
 	client             kubernetes.Interface
 	rgClient           rginterface.Interface
-	metric             autoscalingv2.MetricIdentifier
-	objectReference    custom_metrics.ObjectReference
 	hpa                *autoscalingv2.HorizontalPodAutoscaler
 	interval           time.Duration
 	plugin             CollectorPlugin
@@ -87,9 +102,7 @@ func NewSkipperCollector(client kubernetes.Interface, rgClient rginterface.Inter
 	return &SkipperCollector{
 		client:             client,
 		rgClient:           rgClient,
-		objectReference:    config.ObjectReference,
 		hpa:                hpa,
-		metric:             config.Metric,
 		interval:           interval,
 		plugin:             plugin,
 		config:             *config,
@@ -160,43 +173,54 @@ func getRouteGroupWeight(backends []rgv1.RouteGroupBackendReference, backendName
 func (c *SkipperCollector) getCollector(ctx context.Context) (Collector, error) {
 	var escapedHostnames []string
 	var backendWeight float64
-	switch c.objectReference.Kind {
-	case "Ingress":
-		ingress, err := c.client.NetworkingV1().Ingresses(c.objectReference.Namespace).Get(ctx, c.objectReference.Name, metav1.GetOptions{})
-		if err != nil {
-			return nil, err
-		}
-
-		backendWeight, err = getIngressWeight(ingress.Annotations, c.backendAnnotations, c.backend)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, rule := range ingress.Spec.Rules {
-			escapedHostnames = append(escapedHostnames, regexp.QuoteMeta(strings.Replace(rule.Host, ".", "_", -1)))
-		}
-	case "RouteGroup":
-		routegroup, err := c.rgClient.ZalandoV1().RouteGroups(c.objectReference.Namespace).Get(ctx, c.objectReference.Name, metav1.GetOptions{})
-		if err != nil {
-			return nil, err
-		}
-
-		backendWeight, err = getRouteGroupWeight(routegroup.Spec.DefaultBackends, c.backend)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, host := range routegroup.Spec.Hosts {
-			escapedHostnames = append(escapedHostnames, regexp.QuoteMeta(strings.Replace(host, ".", "_", -1)))
-		}
-	default:
-		return nil, fmt.Errorf("unknown skipper resource kind %s for resource %s/%s", c.objectReference.Kind, c.objectReference.Namespace, c.objectReference.Name)
-	}
-
 	config := c.config
 
-	if len(escapedHostnames) == 0 {
-		return nil, fmt.Errorf("no hosts defined on %s %s/%s, unable to create collector", c.objectReference.Kind, c.objectReference.Namespace, c.objectReference.Name)
+	addHost := func(host string) {
+		escapedHostnames = append(escapedHostnames, regexp.QuoteMeta(strings.Replace(host, ".", "_", -1)))
+	}
+
+	if config.Type == autoscalingv2.ExternalMetricSourceType {
+		backendWeight = 1.0 // backend weight is not supported
+		addHost(config.Metric.Selector.MatchLabels["host"])
+	} else {
+		objectReference := config.ObjectReference
+
+		switch objectReference.Kind {
+		case "Ingress":
+			ingress, err := c.client.NetworkingV1().Ingresses(objectReference.Namespace).Get(ctx, objectReference.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+
+			backendWeight, err = getIngressWeight(ingress.Annotations, c.backendAnnotations, c.backend)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, rule := range ingress.Spec.Rules {
+				addHost(rule.Host)
+			}
+		case "RouteGroup":
+			routegroup, err := c.rgClient.ZalandoV1().RouteGroups(objectReference.Namespace).Get(ctx, objectReference.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+
+			backendWeight, err = getRouteGroupWeight(routegroup.Spec.DefaultBackends, c.backend)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, host := range routegroup.Spec.Hosts {
+				addHost(host)
+			}
+		default:
+			return nil, fmt.Errorf("unknown skipper resource kind %s for resource %s/%s", objectReference.Kind, objectReference.Namespace, objectReference.Name)
+		}
+
+		if len(escapedHostnames) == 0 {
+			return nil, fmt.Errorf("no hosts defined on %s %s/%s, unable to create collector", objectReference.Kind, objectReference.Namespace, objectReference.Name)
+		}
 	}
 
 	config.Config = map[string]string{
@@ -231,7 +255,7 @@ func (c *SkipperCollector) GetMetrics() ([]CollectedMetric, error) {
 	value := values[0]
 
 	// For Kubernetes <v1.14 we have to fall back to manual average
-	if c.config.MetricSpec.Object.Target.AverageValue == nil {
+	if c.config.MetricSpec.Object != nil && c.config.MetricSpec.Object.Target.AverageValue == nil {
 		// get current replicas for the targeted scale object. This is used to
 		// calculate an average metric instead of total.
 		// targetAverageValue will be available in Kubernetes v1.12
